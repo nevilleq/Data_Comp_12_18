@@ -1,0 +1,309 @@
+---
+title: "Data Manipulation, EDA, Statistical Learning Tools"
+author: "Quinton Neville"
+date: "12/8/2018"
+output:
+  #html_document: default
+  pdf_document: default
+  #github_document
+---
+
+```{r results='hide', message=FALSE, warning=FALSE, echo = FALSE}
+#Load all the good stuff.
+library(tidyverse)
+library(readxl)
+library(readr)
+library(p8105.datasets)
+library(patchwork)
+library(ggridges)
+library(gridExtra)
+library(shiny)
+library(plotly)
+library(broom)
+library(scales)
+library(purrr)
+library(koRpus)
+library(modelr)
+library(glmnet)
+library(readr)
+library(purrr)
+library(tree)
+library(randomForest)
+library(gbm)
+library(factoextra)
+library(ggdendro)
+library(stringr)
+library(ggrepel)
+library(graphics)
+library(MASS)
+library(DMwR)
+library(e1071)
+
+#Controlling figure output in markdown
+knitr::opts_chunk$set(
+#  fig.height =   
+  fig.width = 6,
+#  fig.asp = .5,
+  out.width = "90%",
+#  out.height = 
+ fig.align = "center",
+  cache = FALSE
+)
+
+#Set Theme for ggplot2
+theme_set(theme_bw() + theme(plot.title = element_text(hjust = 0.5), legend.position = "bottom"))
+
+#Set Scientific notation output for knitr
+options(scipen = 999)
+```
+
+#Load, clean, manipulate, and tidy the data
+```{r message=FALSE, warning=FALSE}
+# Import data
+cancer_raw = readr::read_csv("./Data/Cancer_Registry.csv") %>% 
+  janitor::clean_names() 
+
+dim(cancer_raw)
+head(cancer_raw)
+
+# Check NA values for each column
+n_NA = sapply(cancer_raw[1:34], function(x) sum(length(which(is.na(x)))))
+n_NA
+
+# Check the percentage of NA values for each column
+percentage_NA = sapply(cancer_raw[1:34], function(x) sum(length(which(is.na(x)))) / 3047)
+percentage_NA %>% data.frame()
+
+#Pulling quartiles for study_per_cap categorical manipulation
+study.quart <- with(cancer_raw, study_per_cap[study_per_cap > 0]) %>%
+  quantile(., probs = c(0.25, 0.5, 0.75))
+
+#Variable Manipulation
+cancer.df <- cancer_raw %>%    #Remove Rows with > 20% missing 
+  dplyr::select(-pct_some_col18_24) %>%  #Remove for too many missing
+  mutate(
+    pct_non_white = pct_black + pct_asian + pct_other_race, #Creating white, non-white percentages variables
+    state = str_split_fixed(geography, ", ", 2)[ ,2] %>% as.factor(), #pulling state variable and casting as factor, possible region?
+    binned_inc_lb = str_split_fixed(binned_inc, ", ", 2)[ ,1] %>% parse_number(), #pulling numeric lower bound
+    binned_inc_ub = str_split_fixed(binned_inc, ", ", 2)[ ,2] %>% parse_number(), #pulling numeric upper bound
+    binned_inc_point = (binned_inc_lb + binned_inc_ub)/2, #computing point estimate from ub,lb (intervals symmetric)
+    study_quantile = ifelse(study_per_cap == 0, "None", 
+                           ifelse(study_per_cap > 0 & study_per_cap <= study.quart[1], "Low", 
+                                  ifelse(study_per_cap > study.quart[1] & study_per_cap <= study.quart[2], "Moderate", 
+                                         ifelse(study_per_cap > study.quart[2] & study_per_cap <= study.quart[3], "High", 
+                                                "Very High")))),
+    study_quantile = as.factor(study_quantile) %>% fct_relevel(., "None", "Low", "Moderate", "High", "Very High"),
+    avg_deaths_yr_pop = avg_deaths_per_year/pop_est2015,  #incorporate two vars into one (multicollinearity)
+    avg_ann_count_pop = avg_ann_count/pop_est2015 #incorporate two vars into one (multicollinearity)
+  ) %>%
+  dplyr::select(-c(binned_inc, geography, study_per_cap))
+
+# Variable Manipulation: Add region classification 
+table(cancer.df$state)  
+
+# create a dataframe containing all the 4-level states names
+NE.name <- c("Connecticut","Maine","Massachusetts","New Hampshire",
+             "Rhode Island","Vermont","New Jersey","New York",
+             "Pennsylvania")
+MW.name <- c("Indiana","Illinois","Michigan","Ohio","Wisconsin",
+             "Iowa","Kansas","Minnesota","Missouri","Nebraska",
+             "North Dakota","South Dakota")
+S.name <- c("Delaware","District of Columbia","Florida","Georgia",
+            "Maryland","North Carolina","South Carolina","Virginia",
+            "West Virginia","Alabama","Kentucky","Mississippi",
+            "Tennessee","Arkansas","Louisiana","Oklahoma","Texas")
+W.name <- c("Arizona","Colorado","Idaho","New Mexico","Montana",
+            "Utah","Nevada","Wyoming","Alaska","California",
+            "Hawaii","Oregon","Washington")
+
+region.list <- list(
+  Northeast = NE.name,
+  Midwest = MW.name,
+  South = S.name,
+  West = W.name)
+
+#create new region variable identical to 'region'
+cancer.df$region <- sapply(cancer.df$state, 
+                 function(x) names(region.list)[grep(x,region.list)])     
+#relevelnumber of countries by region (original variable) 
+```
+
+Add a variable region according toCensus Bureau-designated regions and divisions list, and we can select one significant variable for fitting the model. 
+
+Regions: 
+* `Northeast`;
+* `Midwest`;
+* `South`;
+* `West`. 
+
+
+#Imputing Values with less than 20% missing (two variables)
+
+- pct_employed16_over ~ 4%
+- pct_private_coverage_alone ~ 20%
+
+```{r warning = FALSE, message = FALSE}
+#library(glmnet)
+#library(tidyverse)
+#Impute those missing less than 20%
+#1. pct_employed16_over
+#2. pct_private_coverage_alone
+
+#Set up appropriate test and train for pct_employed16_over (removing other missing % variable and response (target death))
+train.df <- cancer.df %>% dplyr::select(-c(pct_private_coverage_alone, target_death_rate)) %>% filter(!is.na(pct_employed16_over))
+test.df <- cancer.df %>% dplyr::select(-c(pct_private_coverage_alone, target_death_rate)) %>% filter(is.na(pct_employed16_over))
+
+#Function for imputation (after correct test, train set up), charstring must literally be the character of impute variable i.e. "var1"
+impute.lasso <- function(train.df, test.df, charstring){
+
+  if ((charstring %in% names(train.df))) {
+    
+#pull variable index
+index <- which(names(train.df) == charstring)
+  
+
+#Set up Matrices
+#Create Design Matrix Train
+X <- train.df[ ,-index] %>%
+  names() %>% 
+  paste("~ ", paste(., collapse = "+")) %>%
+  formula() %>%
+  model.matrix(.,train.df)
+  
+
+#Create Design Matrix Test
+X1 <- test.df[, -index] %>%
+  names() %>% 
+  paste("~ ", paste(., collapse = "+")) %>%
+  formula() %>%
+  model.matrix(., test.df)
+
+#Remove Intercept  
+X <- X[,-1]
+X1 <- X1[,-1]
+
+#Create Response vector (as matrix)
+Y <- train.df[, index] %>% as.matrix()
+
+#Optimize lambda
+lambda.grid <- 10^seq(-3,1,length = 100)
+
+#CV n = 10
+cv.lasso <- cv.glmnet(X, Y, alpha = 1, intercept = TRUE, lambda = lambda.grid, family = "gaussian")
+
+#Grab optimal lambda
+opt.lambda.lasso <- cv.lasso$lambda.min
+
+#Run model
+unemploy.lasso <- glmnet(X, Y, alpha = 1, intercept = TRUE, lambda = opt.lambda.lasso, family = "gaussian")
+
+#Return predictions
+predict(unemploy.lasso, newx = X1)
+  }else{
+    stop("Error: Incorrect variable name")
+  }
+}
+
+#Impute employed16_over_preds (first since it has less missing data ~4%)
+employed16_over_preds <- impute.lasso(train.df = train.df, test.df, "pct_employed16_over")
+
+#Set up appropriate test and train
+train.df <- cancer.df %>% dplyr::select(-c(pct_employed16_over, target_death_rate)) %>% filter(!is.na(pct_private_coverage_alone))
+test.df <- cancer.df %>% dplyr::select(-c(pct_employed16_over, target_death_rate)) %>% filter(is.na(pct_private_coverage_alone))
+
+#Impute pct_private_coverage_alone (second since it has more missing data ~20%)
+pct_private_coverage_alone_preds <- impute.lasso(train.df = train.df, test.df, "pct_private_coverage_alone")
+
+#Replace Imputed values
+cancer.df <- cancer.df %>%
+  mutate(imp_pct_employed16_over = ifelse(is.na(pct_employed16_over),
+                                          employed16_over_preds, pct_employed16_over),
+         imp_pct_private_coverage_alone = ifelse(is.na(pct_private_coverage_alone),
+                                          pct_private_coverage_alone_preds, pct_private_coverage_alone)
+        )
+
+#Check
+verif.df <- cancer.df %>%
+  dplyr::select(pct_employed16_over, imp_pct_employed16_over, pct_private_coverage_alone, imp_pct_private_coverage_alone)
+```
+
+looks good so we will take out extraneous variables for final df.
+```{r}
+#Looks good, so we will replace for our final data set
+cancer.df <- cancer.df 
+  dplyr::select(-c(pct_employed16_over, pct_private_coverage_alone))
+
+#Check it out 
+str(cancer.df)
+dim(cancer.df)
+
+#Check new percentage missing after removing one and imputing two
+# Check the percentage of NA values for each column
+#percentage_NA = apply(cancer.df, 2, function(x) sum(length(which(is.na(x)))) / nrow(cancer.df))
+#percentage_NA %>% data.frame() %>% knitr::kable()
+
+#No more missing data and we only had to throw out one variable
+```
+
+
+
+#PCA Analysis for Variable Selection
+
+*Plot is a bit messy, take subsets of the data and repeat
+
+```{r fig.width = 10}
+
+#Scale and perform pca (take out non-continuous vars)
+cancer.pca <- cancer.df %>% 
+  dplyr::select(-c(state, study_quantile, target_death_rate)) %>%
+  scale() %>%
+  as.data.frame() %>%
+  prcomp()
+
+
+#str(cancer.pca)
+
+name.vec <- cancer.df %>% dplyr::select(-c(state, study_quantile, target_death_rate)) %>% names()
+
+pca.viz1 <- fviz_pca_var(cancer.pca,
+             col.var = "contrib",
+             gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"),
+             repel = TRUE,
+             select.var = list(name = name.vec[1:18]))
+
+pca.viz2 <- fviz_pca_var(cancer.pca,
+             col.var = "contrib",
+             gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"),
+             repel = TRUE,
+             select.var = list(name = name.vec[19:35]))
+
+pca.viz1 + pca.viz2
+
+
+```
+
+
+Here, we used PCA component analysis on the scaled continuous predictor set, projecting our $p$ = 35 dimensional predictor space onto the 2 dimensional PCA space with the two principal component vectors explaining the highest % of variability in the data( basically the best basis in $\mathcal{R^2}$to visualize how related each of our continuous predictors are to each other) vectors pointing in the same directions are explaining very simimlar types of the variance in the data (i.e. related, potentially multicollinearity), and the length(color) describes the magnitude or strength of how much of the variance in the data the predictor is explaining. It takes a while staring at it to understand exactly what is going on, and I split into two plots for clarity. Here are my takeaways:
+
+1. Median age female and male explain a good amount of variability but are very related, we should take a average of the two for an average median age  
+
+2. Percent white and percent married are explaining similiar variability at similiar strength, pct races are explaining different types of variability in the data, while pct_white and pct_non_white are explaining inverse types of variability in the data (180 degree angle) makes me think we should keep seperate race percentages  or pct_non_white, but not both (obviously) one while be better than the other.  
+
+3. Avg_ann_count, avg deaths, pop_est2015 are all explaining the same type and proportion of variability, should only use one (my best guess is pop_est2015 based on magnitude.)  
+
+3. pct_private, pct_public_cov, and pct_public alone are all explaining different types of variability but at sufficient magnitude and should be kept. However pct_private_cov is highly correlated with income, and should not be included if any type of income variable is in the model. 
+
+4. median_age is not a strong explanotary variable (by magnitude), and weirdly does not equal median_male + median_female /2. So I say we lose median_age and keep a variable for avg_median = median_male + median_female /2.  
+
+5. Drop the mutate avg_ann_count_pop, low magnitude and not explaining anything significantly. See (3.) for reccomendation on which var to select there.
+
+6. For income, all median_income, binned_inc_point estimate, binned_inc_lb, and binned_ub very related. I think we should either use median_income OR binned_inc_point estimate, but retain the lb, and ub as they seem to be explained different types of variability at good magnitude.
+
+7. pct_bach_deg25_over is better than pecent_bach_deg18_24, explaining similar variability. Maybe take an average of the two or only include pct_bach_deg25_over. The target group of our research should be 18-24 or 25 and above? 
+
+8. Incidence rate has relatively small magnitude, but in a direction almost no other variable takes, so that should be kept I think.
+
+9. House hold size looks relatively unrelated
+
+
+
